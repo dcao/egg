@@ -1,5 +1,5 @@
 use crate::*;
-use good_lp::*;
+use grb::prelude::*;
 
 /// A cost function to be used by an [`LpExtractor`].
 pub trait LpCostFunction<L: Language, N: Analysis<L>> {
@@ -36,7 +36,7 @@ impl<L: Language, N: Analysis<L>> LpCostFunction<L, N> for AstSize {
 /// let mut egraph = EGraph::<SymbolLang, ()>::default();
 ///
 /// let f = egraph.add_expr(&"(f x x x)".parse().unwrap());
-/// let g = egraph.add_expr(&"(g x x)".parse().unwrap());
+/// let g = egraph.add_expr(&"(g x y)".parse().unwrap());
 /// egraph.union(f, g);
 /// egraph.rebuild();
 ///
@@ -44,7 +44,7 @@ impl<L: Language, N: Analysis<L>> LpCostFunction<L, N> for AstSize {
 /// let lp_best = LpExtractor::new(&egraph, AstSize).solve(f);
 ///
 /// // In regular extraction, cost is measures on the tree.
-/// assert_eq!(best.to_string(), "(g x x)");
+/// assert_eq!(best.to_string(), "(g x y)");
 ///
 /// // Using ILP only counts common sub-expressions once,
 /// // so it can lead to a smaller DAG expression.
@@ -54,14 +54,15 @@ impl<L: Language, N: Analysis<L>> LpCostFunction<L, N> for AstSize {
 pub struct LpExtractor<'a, L: Language, N: Analysis<L>> {
     egraph: &'a EGraph<L, N>,
     max_order: f64,
-    problem: good_lp::variable::UnsolvedProblem,
+    model: Model,
+    // problem: good_lp::variable::UnsolvedProblem,
     vars: HashMap<Id, ClassVars>,
 }
 
 struct ClassVars {
-    active: Variable,
-    order: Variable,
-    nodes: Vec<Variable>,
+    active: grb::Var,
+    order: grb::Var,
+    nodes: Vec<grb::Var>,
 }
 
 impl<'a, L, N> LpExtractor<'a, L, N>
@@ -75,37 +76,43 @@ where
     where
         CF: LpCostFunction<L, N>,
     {
+        let mut env = grb::Env::new("").unwrap();
+        let mut model = Model::with_env("model1", &env).unwrap();
+
         let max_order = egraph.total_number_of_nodes() as f64 * 10.0;
 
-        let bool_kind = VariableDefinition::new().binary();
-        let order_kind = VariableDefinition::new().max(max_order);
-
-        let mut problem_vars = good_lp::ProblemVariables::default();
         let vars: HashMap<Id, ClassVars> = egraph
             .classes()
             .map(|class| {
+                let mut nodes = vec![];
+
+                for i in 0..class.len() {
+                    nodes.push(add_binvar!(model, name: &format!("n{}-{}", class.id, i)).unwrap());
+                }
+
                 let cvars = ClassVars {
-                    active: problem_vars.add(bool_kind.clone()),
-                    order: problem_vars.add(order_kind.clone()),
-                    nodes: problem_vars.add_vector(bool_kind.clone(), class.len()),
+                    active: add_binvar!(model, name: &format!("a{}", class.id)).unwrap(),
+                    order: add_intvar!(model, name: &format!("o{}", class.id), bounds: 0..max_order).unwrap(),
+                    nodes,
                 };
                 (class.id, cvars)
             })
             .collect();
 
         // cost is the weighted sum of all the nodes
-        let mut cost: Expression = 0.into();
+        let mut cost: Expr = 0.into();
+
         for class in egraph.classes() {
             for (node, &node_active) in class.iter().zip(&vars[&class.id].nodes) {
-                cost += node_active * cost_function.node_cost(egraph, class.id, node)
+                cost = cost + node_active * cost_function.node_cost(egraph, class.id, node)
             }
         }
 
-        let problem = problem_vars.minimise(cost);
+        model.set_objective(cost, Minimize).unwrap();
 
         Self {
             egraph,
-            problem,
+            model,
             vars,
             max_order,
         }
@@ -116,60 +123,61 @@ where
     ///
     /// This is just a shortcut for [`LpExtractor::solve_multiple_using`].
     pub fn solve(self, root: Id) -> RecExpr<L> {
-        self.solve_multiple_using(&[root], good_lp::default_solver)
+        self.solve_multiple_using(&[root])
             .0
     }
 
     /// Extract (potentially multiple) roots using the given
     /// [`good_lp::Solver`](https://docs.rs/good_lp/1.2.0/good_lp/solvers/trait.Solver.html).
-    pub fn solve_multiple_using<S>(self, roots: &[Id], solver: S) -> (RecExpr<L>, Vec<Id>)
-    where
-        S: good_lp::Solver,
+    pub fn solve_multiple_using(self, roots: &[Id]) -> (RecExpr<L>, Vec<Id>)
     {
         let egraph = self.egraph;
-        let mut model = self.problem.using(solver);
+        let mut model = self.model;
 
         for (&id, class_vars) in &self.vars {
-            let active: Expression = class_vars.active.into();
-            let sum_nodes: Expression = class_vars.nodes.iter().sum();
+            let active: Expr = class_vars.active.into();
+            let sum_nodes: Expr = class_vars.nodes.iter().grb_sum();
 
-            let class_order: Expression = class_vars.order.into();
+            let class_order: Expr = class_vars.order.into();
 
             // choosing class implies choosing one of the nodes
-            model.add_constraint(active.leq(sum_nodes));
+            model.add_constr("", c!(active <= sum_nodes)).unwrap();
 
             for (node, &node_var) in self.egraph[id].iter().zip(&class_vars.nodes) {
-                let node_active: Expression = node_var.into();
+                let node_active: Expr = node_var.into();
                 for child in node.children() {
                     let child = &egraph.find(*child);
                     // choosing a node implies choosing each child
-                    model.add_constraint(node_active.clone().leq(self.vars[child].active));
+                    model.add_constr("", c!(node_active.clone() <= self.vars[child].active)).unwrap();
                     // choosing a node also implies this node must be ordered before its children
-                    let child_order: Expression = self.vars[child].order.into();
-                    let left: Expression =
+                    let child_order: Expr = self.vars[child].order.into();
+                    let left: Expr =
                         class_order.clone() + node_active.clone() * self.max_order + 1.0;
-                    let right: Expression = child_order + self.vars[child].active * self.max_order;
-                    model.add_constraint(left.leq(right));
+                    let right: Expr = child_order + self.vars[child].active * self.max_order;
+                    model.add_constr("", c!(left <= right)).unwrap();
                 }
             }
         }
 
         for root in roots {
             let root = &self.vars[&egraph.find(*root)];
-            model.add_constraint(Expression::from(root.active).eq(1));
-            model.add_constraint(Expression::from(root.order).eq(0));
+            model.add_constr("", c!(root.active == 1.0)).unwrap();
+            model.add_constr("", c!(root.order == 0.0)).unwrap();
         }
 
-        let solution = model.solve().unwrap();
+        model.optimize().unwrap();
+        model.write("test.lp").unwrap();
 
         let mut active: Vec<(f64, Id, usize)> = vec![];
         for (&id, v) in &self.vars {
-            let order = solution.value(v.order);
-            if solution.value(v.active) > 0.0 {
+            let order = model.get_obj_attr(attr::X, &v.order).unwrap();
+            let active_val = model.get_obj_attr(attr::X, &v.active).unwrap();
+
+            if active_val > 0.0 {
                 let node_idx = v
                     .nodes
                     .iter()
-                    .position(|&n| solution.value(n) > 0.0)
+                    .position(|n| model.get_obj_attr(attr::X, n).unwrap() > 0.0)
                     .unwrap();
                 active.push((order, id, node_idx))
             }
@@ -197,6 +205,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{SymbolLang as S, *};
+    use super::*;
 
     #[test]
     fn simple_lp_extract_two() {
@@ -206,7 +215,7 @@ mod tests {
         let f = egraph.add(S::new("f", vec![plus]));
         let g = egraph.add(S::new("g", vec![plus]));
         let ext = LpExtractor::new(&egraph, AstSize);
-        let (exp, ids) = ext.solve_multiple_using(&[f, g], good_lp::default_solver);
+        let (exp, ids) = ext.solve_multiple_using(&[f, g]);
         assert_eq!(exp.as_ref().len(), 4);
         assert_eq!(ids.len(), 2);
         println!("{:?}", exp);
