@@ -22,7 +22,7 @@ impl Analysis<Prop> for ConstantFold {
         merge_max(to, from)
     }
 
-    fn make(egraph: &EGraph, enode: &Prop) -> Self::Data {
+    fn make(&self, egraph: &EGraph, enode: &Prop) -> Self::Data {
         let x = |i: &Id| egraph[*i].data.as_ref().map(|c| c.0);
         let result = match enode {
             Prop::Bool(c) => Some((*c, c.to_string().parse().unwrap())),

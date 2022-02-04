@@ -684,7 +684,7 @@ pub trait Analysis<L: Language>: Sized {
     /// Makes a new [`Analysis`] for a given enode
     /// [`Analysis`].
     ///
-    fn make(egraph: &EGraph<L, Self>, enode: &L) -> Self::Data;
+    fn make(&self, egraph: &EGraph<L, Self>, enode: &L) -> Self::Data;
 
     /// An optional hook that allows inspection before a [`union`] occurs.
     ///
@@ -733,7 +733,7 @@ pub trait Analysis<L: Language>: Sized {
 
 impl<L: Language> Analysis<L> for () {
     type Data = ();
-    fn make(_egraph: &EGraph<L, Self>, _enode: &L) -> Self::Data {}
+    fn make(&self, _egraph: &EGraph<L, Self>, _enode: &L) -> Self::Data {}
     fn merge(&mut self, _: &mut Self::Data, _: Self::Data) -> DidMerge {
         DidMerge(false, false)
     }
