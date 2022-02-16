@@ -530,7 +530,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         let class = EClass {
             id,
             nodes: vec![enode.clone()],
-            data: N::make(self, &enode),
+            data: self.analysis.make(self, &enode),
             parents: Default::default(),
         };
 
